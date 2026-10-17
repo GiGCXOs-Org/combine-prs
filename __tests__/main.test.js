@@ -69,6 +69,9 @@ beforeEach(() => {
         ]
       }),
       graphql: jest.fn().mockImplementation((_query, params) => {
+        if (params.input?.refUpdates) {
+          return {updateRefs: {clientMutationId: null}}
+        }
         switch (params.pull_number) {
           case 1:
           case 2:
@@ -105,6 +108,9 @@ beforeEach(() => {
           })
         },
         repos: {
+          get: jest.fn().mockResolvedValue({
+            data: {node_id: 'test-repository-node-id'}
+          }),
           // mock the first value of merge to be a success and the second to be an exception
           merge: jest
             .fn()
@@ -1587,6 +1593,24 @@ test('successfully runs the action and updates the pull request branch', async (
   )
 })
 
+async function runScratchCase(configureClient) {
+  process.env.INPUT_CREATE_FROM_SCRATCH = 'true'
+  process.env.INPUT_UPDATE_BRANCH = 'false'
+  const original = github.getOctokit.getMockImplementation()
+  let client
+  github.getOctokit.mockImplementation(() => {
+    client = original()
+    client.rest.git.createRef = jest.fn().mockResolvedValue({data: {}})
+    client.rest.git.deleteRef = jest.fn().mockResolvedValue({data: {}})
+    client.rest.git.getRef = jest.fn().mockResolvedValue({
+      data: {object: {sha: 'c'.repeat(40)}}
+    })
+    configureClient(client)
+    return client
+  })
+  return {result: await run(), client}
+}
+
 test('successfully runs the action and uses a fresh pull request branch', async () => {
   const createRef = jest.fn().mockReturnValueOnce({
     data: {}
@@ -1620,6 +1644,9 @@ test('successfully runs the action and uses a fresh pull request branch', async 
         ]
       }),
       graphql: jest.fn().mockImplementation((_query, params) => {
+        if (params.input?.refUpdates) {
+          return {updateRefs: {clientMutationId: null}}
+        }
         switch (params.pull_number) {
           case 1:
           case 2:
@@ -1665,6 +1692,9 @@ test('successfully runs the action and uses a fresh pull request branch', async 
           deleteRef
         },
         repos: {
+          get: jest.fn().mockResolvedValue({
+            data: {node_id: 'test-repository-node-id'}
+          }),
           // mock the first value of merge to be a success and the second to be an exception
           merge: jest
             .fn()
@@ -1708,10 +1738,22 @@ test('successfully runs the action and uses a fresh pull request branch', async 
       ref: expect.stringContaining('heads/combined-prs-branch-working')
     })
   )
-  expect(updateRef).toHaveBeenCalledWith(
+  const client = github.getOctokit.mock.results[0].value
+  expect(updateRef).not.toHaveBeenCalled()
+  expect(client.graphql).toHaveBeenCalledWith(
+    expect.stringContaining('updateRefs'),
     expect.objectContaining({
-      ref: expect.stringContaining('heads/combined-prs-branch'),
-      sha
+      input: {
+        repositoryId: 'test-repository-node-id',
+        refUpdates: [
+          {
+            name: 'refs/heads/combined-prs-branch',
+            beforeOid: 'b'.repeat(40),
+            afterOid: sha,
+            force: true
+          }
+        ]
+      }
     })
   )
   expect(deleteRef).toHaveBeenCalledWith(
@@ -1729,6 +1771,178 @@ test('successfully runs the action and uses a fresh pull request branch', async 
     'pr_url',
     'https://github.com/test-owner/test-repo/pull/100'
   )
+})
+
+test('rejects a discovered combined PR without a valid head SHA', async () => {
+  const original = github.getOctokit.getMockImplementation()
+  let client
+  github.getOctokit.mockImplementation(() => {
+    client = original()
+    const combined = buildPR(100, 'combined-prs-branch', [], 'main', true)
+    delete combined.head.sha
+    client.paginate.mockReturnValue([
+      buildPR(1, 'dependabot-1'),
+      buildPR(2, 'dependabot-2'),
+      combined
+    ])
+    return client
+  })
+
+  expect(await run()).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Existing combined PR has no valid head SHA'
+  )
+  expect(client.rest.git.createRef).not.toHaveBeenCalled()
+})
+
+test('rejects a changed combined PR head before branch work', async () => {
+  const original = github.getOctokit.getMockImplementation()
+  let client
+  github.getOctokit.mockImplementation(() => {
+    client = original()
+    client.paginate.mockReturnValue([
+      buildPR(1, 'dependabot-1'),
+      buildPR(2, 'dependabot-2'),
+      buildPR(100, 'combined-prs-branch', [], 'main', true)
+    ])
+    const changed = buildPR(100, 'combined-prs-branch', [], 'main', true)
+    changed.head.sha = 'd'.repeat(40)
+    client.rest.pulls.get = jest.fn().mockResolvedValue({data: changed})
+    return client
+  })
+
+  expect(await run()).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Existing combined PR changed or is not draft'
+  )
+  expect(client.rest.git.createRef).not.toHaveBeenCalled()
+})
+
+test('does not replace a scratch branch without a matching draft PR', async () => {
+  const {result, client} = await runScratchCase(client => {
+    client.rest.git.createRef
+      .mockResolvedValueOnce({data: {}})
+      .mockRejectedValueOnce(new AlreadyExistsError('Branch exists'))
+  })
+
+  expect(result).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Combined branch exists without a matching draft PR'
+  )
+  expect(client.graphql).not.toHaveBeenCalledWith(
+    expect.stringContaining('updateRefs'),
+    expect.anything()
+  )
+})
+
+test('rejects a scratch replacement with an invalid expected SHA', async () => {
+  const {result, client} = await runScratchCase(client => {
+    const sources = [buildPR(1, 'dependabot-1'), buildPR(2, 'dependabot-2')]
+    for (const source of sources) source.base.sha = 'invalid'
+    client.paginate.mockReturnValue(sources)
+  })
+
+  expect(result).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Combined branch update has no valid head SHA'
+  )
+  expect(client.graphql).not.toHaveBeenCalledWith(
+    expect.stringContaining('updateRefs'),
+    expect.anything()
+  )
+})
+
+test('rejects a scratch replacement with an invalid working SHA', async () => {
+  const {result} = await runScratchCase(client => {
+    client.rest.git.getRef.mockResolvedValue({
+      data: {object: {sha: 'invalid'}}
+    })
+  })
+
+  expect(result).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Combined branch update has no valid head SHA'
+  )
+})
+
+test('rejects a scratch replacement without a repository node ID', async () => {
+  const {result, client} = await runScratchCase(client => {
+    client.rest.repos.get.mockResolvedValue({data: {}})
+  })
+
+  expect(result).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Combined branch repository has no node ID'
+  )
+  expect(client.graphql).not.toHaveBeenCalledWith(
+    expect.stringContaining('updateRefs'),
+    expect.anything()
+  )
+})
+
+test('rejects a scratch replacement without mutation confirmation', async () => {
+  const {result, client} = await runScratchCase(client => {
+    const originalGraphql = client.graphql.getMockImplementation()
+    client.graphql.mockImplementation((query, params) =>
+      params.input?.refUpdates ? {} : originalGraphql(query, params)
+    )
+  })
+
+  expect(result).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Combined branch conditional update was not confirmed'
+  )
+  expect(client.rest.git.deleteRef).toHaveBeenCalledTimes(1)
+})
+
+test('preserves a concurrent scratch branch update', async () => {
+  const {result, client} = await runScratchCase(client => {
+    const originalGraphql = client.graphql.getMockImplementation()
+    client.graphql.mockImplementation((query, params) => {
+      if (params.input?.refUpdates) {
+        throw new Error('beforeOid no longer matches')
+      }
+      return originalGraphql(query, params)
+    })
+  })
+
+  expect(result).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Combined branch changed before conditional update'
+  )
+  expect(client.rest.git.updateRef).not.toHaveBeenCalled()
+  expect(client.rest.pulls.create).not.toHaveBeenCalled()
+})
+
+test('keeps an existing draft after a conditional scratch replacement', async () => {
+  const {result, client} = await runScratchCase(client => {
+    client.paginate.mockReturnValue([
+      buildPR(1, 'dependabot-1'),
+      buildPR(2, 'dependabot-2'),
+      buildPR(100, 'combined-prs-branch', [], 'main', true)
+    ])
+    const before = buildPR(100, 'combined-prs-branch', [], 'main', true)
+    const after = buildPR(100, 'combined-prs-branch', [], 'main', true)
+    after.head.sha = 'c'.repeat(40)
+    after.html_url = 'https://github.com/test-owner/test-repo/pull/100'
+    client.rest.pulls.get = jest
+      .fn()
+      .mockResolvedValueOnce({data: before})
+      .mockResolvedValueOnce({data: after})
+    client.rest.pulls.update = jest.fn().mockResolvedValue({data: after})
+  })
+
+  expect(result).toBe('success')
+  expect(client.graphql).toHaveBeenCalledWith(
+    expect.stringContaining('updateRefs'),
+    expect.objectContaining({
+      input: expect.objectContaining({
+        refUpdates: [expect.objectContaining({beforeOid: 'a'.repeat(40)})]
+      })
+    })
+  )
+  expect(client.rest.pulls.update).toHaveBeenCalledTimes(1)
+  expect(setOutputMock).toHaveBeenCalledWith('pr_origin', 'existing')
 })
 
 test('successfully runs the action and uses the existing pull request branch', async () => {
@@ -2014,10 +2228,12 @@ function buildPR(number, head, labels = [], base = null, draft = false) {
     draft,
     head: {
       ref: head,
+      sha: 'a'.repeat(40),
       repo: {full_name: 'test-owner/test-repo'}
     },
     base: {
-      ref: base ?? 'main'
+      ref: base ?? 'main',
+      sha: 'b'.repeat(40)
     },
     labels: labels.map(labelName => {
       return {name: labelName}
