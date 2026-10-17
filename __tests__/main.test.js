@@ -121,6 +121,7 @@ beforeEach(() => {
           create: jest.fn().mockReturnValueOnce({
             data: {
               number: 100,
+              draft: true,
               html_url: 'https://github.com/test-owner/test-repo/pull/100'
             }
           })
@@ -188,6 +189,11 @@ test('successfully runs the action', async () => {
   )
   expect(infoMock).toHaveBeenCalledWith('Combined PR number: 100')
   expect(setOutputMock).toHaveBeenCalledWith('pr_number', 100)
+  expect(setOutputMock).toHaveBeenCalledWith('pr_origin', 'created')
+  const client = github.getOctokit.mock.results[0].value
+  expect(client.rest.pulls.create).toHaveBeenCalledWith(
+    expect.objectContaining({draft: true})
+  )
   expect(setOutputMock).toHaveBeenCalledWith(
     'pr_url',
     'https://github.com/test-owner/test-repo/pull/100'
@@ -430,7 +436,11 @@ test('successfully runs the action with the select_label option', async () => {
         },
         pulls: {
           create: jest.fn().mockReturnValueOnce({
-            data: {}
+            data: {
+              number: 100,
+              draft: true,
+              html_url: 'https://github.com/test-owner/test-repo/pull/100'
+            }
           })
         }
       }
@@ -529,7 +539,11 @@ test('runs the action and finds the combine branch already exists and the PR als
   jest.spyOn(github, 'getOctokit').mockImplementation(() => {
     return {
       paginate: jest.fn().mockImplementation(() => {
-        return [buildPR(1, 'dependabot-1'), buildPR(2, 'dependabot-2')]
+        return [
+          buildPR(1, 'dependabot-1'),
+          buildPR(2, 'dependabot-2'),
+          buildPR(100, 'combined-prs-branch', [], 'main', true)
+        ]
       }),
       graphql: jest.fn().mockImplementation(() => {
         return buildStatusResponse('APPROVED', 'SUCCESS')
@@ -563,15 +577,12 @@ test('runs the action and finds the combine branch already exists and the PR als
           })
         },
         pulls: {
-          create: jest
-            .fn()
-            .mockRejectedValueOnce(new AlreadyExistsError('PR already exists')),
-          list: jest.fn().mockReturnValueOnce({
-            data: [
-              {
-                number: 100
-              }
-            ]
+          create: jest.fn(),
+          get: jest.fn().mockResolvedValue({
+            data: {
+              ...buildPR(100, 'combined-prs-branch', [], 'main', true),
+              html_url: 'https://github.com/test-owner/test-repo/pull/100'
+            }
           }),
           update: jest.fn().mockReturnValueOnce({
             data: {}
@@ -586,6 +597,109 @@ test('runs the action and finds the combine branch already exists and the PR als
     'Branch already exists - will try to merge into it'
   )
   expect(setOutputMock).toHaveBeenCalledWith('pr_number', 100)
+  expect(setOutputMock).toHaveBeenCalledWith('pr_origin', 'existing')
+  const client = github.getOctokit.mock.results[0].value
+  expect(client.rest.pulls.get).toHaveBeenCalledTimes(2)
+  expect(client.rest.pulls.create).not.toHaveBeenCalled()
+})
+
+test('rejects an existing PR that becomes ready before its body update', async () => {
+  const original = github.getOctokit.getMockImplementation()
+  let client
+  github.getOctokit.mockImplementation(() => {
+    client = original()
+    client.paginate.mockReturnValue([
+      buildPR(1, 'dependabot-1'),
+      buildPR(2, 'dependabot-2'),
+      buildPR(100, 'combined-prs-branch', [], 'main', true)
+    ])
+    client.rest.pulls.get = jest
+      .fn()
+      .mockResolvedValueOnce({
+        data: buildPR(100, 'combined-prs-branch', [], 'main', true)
+      })
+      .mockResolvedValueOnce({
+        data: buildPR(100, 'combined-prs-branch', [], 'main', false)
+      })
+    client.rest.pulls.update = jest.fn()
+    return client
+  })
+
+  expect(await run()).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Existing combined PR changed or is not draft'
+  )
+  expect(client.rest.pulls.update).not.toHaveBeenCalled()
+  expect(client.rest.pulls.create).not.toHaveBeenCalled()
+  expect(setOutputMock).not.toHaveBeenCalledWith('pr_origin', 'existing')
+})
+
+test('rejects a PR that becomes ready before any branch change', async () => {
+  const original = github.getOctokit.getMockImplementation()
+  let client
+  github.getOctokit.mockImplementation(() => {
+    client = original()
+    client.paginate.mockReturnValue([
+      buildPR(1, 'dependabot-1'),
+      buildPR(2, 'dependabot-2'),
+      buildPR(100, 'combined-prs-branch', [], 'main', true)
+    ])
+    client.rest.pulls.get = jest.fn().mockResolvedValue({
+      data: buildPR(100, 'combined-prs-branch', [], 'main', false)
+    })
+    return client
+  })
+
+  expect(await run()).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Existing combined PR changed or is not draft'
+  )
+  expect(client.rest.git.createRef).not.toHaveBeenCalled()
+  expect(client.rest.repos.merge).not.toHaveBeenCalled()
+  expect(client.rest.pulls.create).not.toHaveBeenCalled()
+})
+
+test('rejects a ready combined-head PR with another base before branch changes', async () => {
+  const original = github.getOctokit.getMockImplementation()
+  let client
+  github.getOctokit.mockImplementation(() => {
+    client = original()
+    client.paginate.mockReturnValue([
+      buildPR(1, 'dependabot-1'),
+      buildPR(2, 'dependabot-2'),
+      buildPR(100, 'combined-prs-branch', [], 'release', false)
+    ])
+    return client
+  })
+
+  expect(await run()).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Combined PR is ambiguous or was not created as a draft'
+  )
+  expect(client.rest.git.createRef).not.toHaveBeenCalled()
+  expect(client.rest.repos.merge).not.toHaveBeenCalled()
+  expect(client.rest.pulls.create).not.toHaveBeenCalled()
+})
+
+test('rejects a creation response that does not confirm draft state', async () => {
+  const original = github.getOctokit.getMockImplementation()
+  let client
+  github.getOctokit.mockImplementation(() => {
+    client = original()
+    client.rest.pulls.create.mockReset().mockResolvedValue({
+      data: {number: 100, draft: false}
+    })
+    return client
+  })
+
+  expect(await run()).toBe('failure')
+  expect(client.rest.pulls.create).toHaveBeenCalledWith(
+    expect.objectContaining({draft: true})
+  )
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'GitHub did not confirm draft creation'
+  )
+  expect(setOutputMock).not.toHaveBeenCalledWith('pr_origin', 'created')
 })
 
 test('runs the action and fails to create a pull request', async () => {
@@ -657,11 +771,15 @@ test('runs the action and fails to create a pull request', async () => {
   )
 })
 
-test('runs the action and finds the combine branch already exists and the PR also exists and the PR is in a closed state', async () => {
+test('rejects a ready existing combined PR before changing its branch', async () => {
   jest.spyOn(github, 'getOctokit').mockImplementation(() => {
     return {
       paginate: jest.fn().mockImplementation(() => {
-        return [buildPR(1, 'dependabot-1'), buildPR(2, 'dependabot-2')]
+        return [
+          buildPR(1, 'dependabot-1'),
+          buildPR(2, 'dependabot-2'),
+          buildPR(100, 'combined-prs-branch', [], 'main', false)
+        ]
       }),
       graphql: jest.fn().mockImplementation(() => {
         return buildStatusResponse('APPROVED', 'SUCCESS')
@@ -714,11 +832,14 @@ test('runs the action and finds the combine branch already exists and the PR als
     }
   })
 
-  expect(await run()).toBe('success')
-  expect(warningMock).toHaveBeenCalledWith(
-    'Branch already exists - will try to merge into it'
+  expect(await run()).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Combined PR is ambiguous or was not created as a draft'
   )
-  expect(setOutputMock).toHaveBeenCalledWith('pr_number', 100)
+  const client = github.getOctokit.mock.results[0].value
+  expect(client.rest.git.createRef).not.toHaveBeenCalled()
+  expect(client.rest.repos.merge).not.toHaveBeenCalled()
+  expect(client.rest.pulls.create).not.toHaveBeenCalled()
 })
 
 test('runs the action and only one branch matches criteria', async () => {
@@ -879,6 +1000,7 @@ test('successfully runs the action and sets labels', async () => {
           create: jest.fn().mockReturnValueOnce({
             data: {
               number: 100,
+              draft: true,
               html_url: 'https://github.com/test-owner/test-repo/pull/100'
             }
           })
@@ -1041,6 +1163,7 @@ test('successfully runs the action and sets labels when one PR has no CI defined
           create: jest.fn().mockReturnValueOnce({
             data: {
               number: 100,
+              draft: true,
               html_url: 'https://github.com/test-owner/test-repo/pull/100'
             }
           })
@@ -1207,6 +1330,7 @@ test('successfully runs the action and sets labels when one PR has no CI defined
           create: jest.fn().mockReturnValueOnce({
             data: {
               number: 100,
+              draft: true,
               html_url: 'https://github.com/test-owner/test-repo/pull/100'
             }
           }),
@@ -1321,6 +1445,7 @@ test('successfully runs the action and sets labels when one PR has no CI defined
           create: jest.fn().mockReturnValueOnce({
             data: {
               number: 100,
+              draft: true,
               html_url: 'https://github.com/test-owner/test-repo/pull/100'
             }
           }),
@@ -1435,6 +1560,7 @@ test('successfully runs the action and updates the pull request branch', async (
           create: jest.fn().mockReturnValueOnce({
             data: {
               number: 100,
+              draft: true,
               html_url: 'https://github.com/test-owner/test-repo/pull/100'
             }
           }),
@@ -1555,6 +1681,7 @@ test('successfully runs the action and uses a fresh pull request branch', async 
           create: jest.fn().mockReturnValueOnce({
             data: {
               number: 100,
+              draft: true,
               html_url: 'https://github.com/test-owner/test-repo/pull/100'
             }
           }),
@@ -1698,6 +1825,7 @@ test('successfully runs the action and uses the existing pull request branch', a
           create: jest.fn().mockReturnValueOnce({
             data: {
               number: 100,
+              draft: true,
               html_url: 'https://github.com/test-owner/test-repo/pull/100'
             }
           }),
@@ -1837,6 +1965,7 @@ test('successfully runs the action and sets assignees', async () => {
           create: jest.fn().mockReturnValueOnce({
             data: {
               number: 100,
+              draft: true,
               html_url: 'https://github.com/test-owner/test-repo/pull/100'
             }
           })
@@ -1877,12 +2006,15 @@ function buildStatusResponse(reviewDecision, ciStatus) {
   }
 }
 
-function buildPR(number, head, labels = [], base = null) {
+function buildPR(number, head, labels = [], base = null, draft = false) {
   return {
     number: number,
     title: `Update dependency ${number}`,
+    state: 'open',
+    draft,
     head: {
-      ref: head
+      ref: head,
+      repo: {full_name: 'test-owner/test-repo'}
     },
     base: {
       ref: base ?? 'main'

@@ -108,6 +108,50 @@ export async function run() {
     return 'not enough PRs/branches matched criteria to create a combined PR'
   }
 
+  // Refuse to mutate the combined branch when its current PR is ready. A
+  // previously created draft still needs independent owner-held proof before
+  // a caller may treat its later head as admitted.
+  const repositoryName = `${context.repo.owner}/${context.repo.repo}`
+  const existingCombinedPRs = pulls.filter(
+    pull =>
+      pull.head?.ref === combineBranchName &&
+      pull.head?.repo?.full_name?.toLowerCase() === repositoryName.toLowerCase()
+  )
+  if (
+    existingCombinedPRs.length > 1 ||
+    (existingCombinedPRs.length === 1 &&
+      (existingCombinedPRs[0].draft !== true ||
+        existingCombinedPRs[0].base?.ref !== baseBranch))
+  ) {
+    core.setFailed('Combined PR is ambiguous or was not created as a draft')
+    return 'failure'
+  }
+  const existingCombinedPR = existingCombinedPRs[0]
+
+  async function readCurrentCombinedPR() {
+    const refreshed = await octokit.rest.pulls.get({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      pull_number: existingCombinedPR.number
+    })
+    const pr = refreshed.data
+    if (
+      pr?.number !== existingCombinedPR.number ||
+      pr.draft !== true ||
+      pr.state !== 'open' ||
+      pr.head?.ref !== combineBranchName ||
+      pr.head?.repo?.full_name?.toLowerCase() !==
+        repositoryName.toLowerCase() ||
+      pr.base?.ref !== baseBranch
+    ) {
+      core.setFailed('Existing combined PR changed or is not draft')
+      return null
+    }
+    return pr
+  }
+
+  if (existingCombinedPR && !(await readCurrentCombinedPR())) return 'failure'
+
   let workingRef = combineBranchName
   if (createFromScratch) {
     workingRef = combineBranchName + '-working'
@@ -222,37 +266,31 @@ export async function run() {
 
   core.debug('PR body: ' + body)
 
-  var pullRequest
-  try {
-    pullRequest = await octokit.rest.pulls.create({
+  let pullRequest
+  let prOrigin
+  if (existingCombinedPR) {
+    const pr = await readCurrentCombinedPR()
+    if (!pr) return 'failure'
+    await octokit.rest.pulls.update({
       owner: context.repo.owner,
       repo: context.repo.repo,
-      title: prTitle,
-      head: combineBranchName,
-      base: baseBranch,
+      pull_number: pr.number,
       body: body
     })
-  } catch (error) {
-    if (error?.status === 422) {
-      core.warning('Combined PR already exists')
-      // update the PR body
-      const prs = await octokit.rest.pulls.list({
+    pullRequest = {data: pr}
+    prOrigin = 'existing'
+  } else {
+    try {
+      pullRequest = await octokit.rest.pulls.create({
         owner: context.repo.owner,
         repo: context.repo.repo,
-        head: context.repo.owner + ':' + combineBranchName,
+        title: prTitle,
+        head: combineBranchName,
         base: baseBranch,
-        state: 'open'
+        body: body,
+        draft: true
       })
-      const pr = prs.data[0]
-      core.info('Updating PR body')
-      await octokit.rest.pulls.update({
-        owner: context.repo.owner,
-        repo: context.repo.repo,
-        pull_number: pr.number,
-        body: body
-      })
-      pullRequest = {data: pr}
-    } else {
+    } catch (error) {
       if (
         error?.message?.includes(
           'GitHub Actions is not permitted to create or approve pull requests'
@@ -266,18 +304,11 @@ export async function run() {
       core.setFailed(`Failed to create combined PR - ${error}`)
       return 'failure'
     }
-  }
-
-  // check the combined PR's state to see if it is closed
-  const combinedPRState = pullRequest.data.state
-  if (combinedPRState === 'closed') {
-    core.info('Combined PR is closed - attempting to reopen')
-    await octokit.rest.pulls.update({
-      owner: context.repo.owner,
-      repo: context.repo.repo,
-      pull_number: pullRequest.data.number,
-      state: 'open'
-    })
+    if (pullRequest?.data?.draft !== true) {
+      core.setFailed('GitHub did not confirm draft creation')
+      return 'failure'
+    }
+    prOrigin = 'created'
   }
 
   if (labels !== '') {
@@ -343,6 +374,7 @@ export async function run() {
   // output pull request number
   core.info('Combined PR number: ' + pullRequest.data.number)
   core.setOutput('pr_number', pullRequest.data.number)
+  core.setOutput('pr_origin', prOrigin)
 
   return 'success'
 }

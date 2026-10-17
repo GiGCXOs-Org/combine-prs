@@ -74,6 +74,8 @@ outputs:
     description: The pull request URL if a PR was created
   pr_number:
     description: The pull request number if a PR was created
+  pr_origin:
+    description: "created for a newly created draft PR; existing for a previously opened draft PR"
 runs:
   using: "node20"
   main: "dist/index.js"
