@@ -77,5 +77,5 @@ outputs:
   pr_origin:
     description: "created for a newly created draft PR; existing for a previously opened draft PR"
 runs:
-  using: "node20"
+  using: "node24"
   main: "dist/index.js"
