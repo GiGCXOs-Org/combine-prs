@@ -17,6 +17,7 @@ export async function run() {
   const combineBranchName = core.getInput('combine_branch_name')
   const ignoreLabel = core.getInput('ignore_label')
   const selectLabel = core.getInput('select_label')
+  const requiredSourceBase = core.getInput('required_source_base').trim()
   const labels = core.getInput('labels').trim()
   const assignees = core.getInput('assignees').trim()
   const token = core.getInput('github_token', {required: true})
@@ -76,6 +77,17 @@ export async function run() {
       }
     }
 
+    if (requiredSourceBase && pull.base?.ref !== requiredSourceBase) {
+      core.info(
+        `Discarding ${branch} because its base is not ${requiredSourceBase}`
+      )
+      continue
+    }
+    if (requiredSourceBase && (pull.state !== 'open' || pull.draft !== false)) {
+      core.info(`Discarding ${branch} because it is not an open ready PR`)
+      continue
+    }
+
     // Check labels
     let statusOK = await checkLabels(pull, branch, selectLabel, ignoreLabel)
 
@@ -85,11 +97,28 @@ export async function run() {
       (await checkStatus(pull, branch, octokit, mustBeGreen, mustBeApproved))
 
     if (statusOK) {
+      if (
+        requiredSourceBase &&
+        (!/^[0-9a-f]{40}$/i.test(pull.head?.sha ?? '') ||
+          pull.head?.repo?.full_name?.toLowerCase() !==
+            `${context.repo.owner}/${context.repo.repo}`.toLowerCase())
+      ) {
+        core.setFailed(
+          `Selected source PR #${pull.number} has no valid repository head`
+        )
+        return 'failure'
+      }
       core.info('Adding branch to array: ' + branch)
       const prString = `${autoclose ? 'Closes ' : ''}#${pull['number']} ${
         pull['title']
       }`
-      branchesAndPRStrings.push({branch, prString})
+      branchesAndPRStrings.push({
+        branch,
+        prString,
+        number: pull.number,
+        title: pull.title,
+        headSha: pull.head.sha
+      })
       baseBranch = pull['base']['ref']
       baseBranchSHA = pull['base']['sha']
     }
@@ -113,6 +142,54 @@ export async function run() {
   // previously created draft still needs independent owner-held proof before
   // a caller may treat its later head as admitted.
   const repositoryName = `${context.repo.owner}/${context.repo.repo}`
+  async function verifySelectedSources() {
+    if (!requiredSourceBase) return true
+    try {
+      for (const source of branchesAndPRStrings) {
+        const {data: current} = await octokit.rest.pulls.get({
+          owner: context.repo.owner,
+          repo: context.repo.repo,
+          pull_number: source.number
+        })
+        if (
+          current?.number !== source.number ||
+          current.state !== 'open' ||
+          current.draft !== false ||
+          current.title !== source.title ||
+          current.base?.ref !== requiredSourceBase ||
+          current.head?.ref !== source.branch ||
+          current.head?.sha !== source.headSha ||
+          current.head?.repo?.full_name?.toLowerCase() !==
+            repositoryName.toLowerCase() ||
+          !(await checkLabels(
+            current,
+            source.branch,
+            selectLabel,
+            ignoreLabel
+          )) ||
+          !(await checkStatus(
+            current,
+            source.branch,
+            octokit,
+            mustBeGreen,
+            mustBeApproved
+          ))
+        ) {
+          core.setFailed(
+            `Selected source PR #${source.number} changed or is ineligible`
+          )
+          return false
+        }
+      }
+    } catch (error) {
+      core.error(error)
+      core.setFailed('Could not revalidate selected source PRs')
+      return false
+    }
+    return true
+  }
+
+  if (!(await verifySelectedSources())) return 'failure'
   const existingCombinedPRs = pulls.filter(
     pull =>
       pull.head?.ref === combineBranchName &&
@@ -162,7 +239,10 @@ export async function run() {
     return 'failure'
   }
 
-  const stagesCombinedHead = createFromScratch || Boolean(existingCombinedPR)
+  const stagesCombinedHead =
+    createFromScratch ||
+    Boolean(existingCombinedPR) ||
+    Boolean(requiredSourceBase)
   const workingRef = stagesCombinedHead
     ? `combine-prs-working/${randomUUID()}`
     : combineBranchName
@@ -175,7 +255,9 @@ export async function run() {
         owner: context.repo.owner,
         repo: context.repo.repo,
         ref: 'refs/heads/' + workingRef,
-        sha: createFromScratch ? baseBranchSHA : existingHeadSha
+        sha: createFromScratch
+          ? baseBranchSHA
+          : (existingHeadSha ?? baseBranchSHA)
       })
     } catch (error) {
       // Otherwise, fail the Action
@@ -214,13 +296,13 @@ export async function run() {
     }
 
     // Merge all branches into the working ref.
-    for (const {branch, prString} of branchesAndPRStrings) {
+    for (const {branch, prString, headSha} of branchesAndPRStrings) {
       try {
         const mergeResult = await octokit.rest.repos.merge({
           owner: context.repo.owner,
           repo: context.repo.repo,
           base: workingRef,
-          head: branch
+          head: requiredSourceBase ? headSha : branch
         })
         if (existingCombinedPR && !createFromScratch) {
           if (
@@ -246,6 +328,7 @@ export async function run() {
     }
 
     if (stagesCombinedHead) {
+      if (!(await verifySelectedSources())) return 'failure'
       // Get the updated ref of the working branch
       const {
         data: {object: workingRefObject}
