@@ -44,6 +44,7 @@ As mentioned above is this README, a core reason why this Action exists is to "c
 | ---- | ----------- |
 | `pr_url` | The pull request URL if a PR was created |
 | `pr_number` | The pull request number if a PR was created |
+| `pr_origin` | `created` if this run created a draft combined PR, or `existing` if it updated an open draft combined PR. This output does not prove lifecycle admission. |
 
 ## Example 📸
 

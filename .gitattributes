@@ -1,1 +1,3 @@
 dist/** -diff linguist-generated=true
+src/functions/check-labels.js text eol=lf
+src/functions/check-status.js text eol=lf
