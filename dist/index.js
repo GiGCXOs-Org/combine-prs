@@ -3736,7 +3736,7 @@ module.exports = __toCommonJS(dist_src_exports);
 var import_universal_user_agent = __nccwpck_require__(3843);
 
 // pkg/dist-src/version.js
-var VERSION = "9.0.5";
+var VERSION = "9.0.6";
 
 // pkg/dist-src/defaults.js
 var userAgent = `octokit-endpoint.js/${VERSION} ${(0, import_universal_user_agent.getUserAgent)()}`;
@@ -3841,9 +3841,9 @@ function addQueryParameters(url, parameters) {
 }
 
 // pkg/dist-src/util/extract-url-variable-names.js
-var urlVariableRegex = /\{[^}]+\}/g;
+var urlVariableRegex = /\{[^{}}]+\}/g;
 function removeNonChars(variableName) {
-  return variableName.replace(/^\W+|\W+$/g, "").split(/,/);
+  return variableName.replace(/(?:^\W+)|(?:(?<!\W)\W+$)/g, "").split(/,/);
 }
 function extractUrlVariableNames(url) {
   const matches = url.match(urlVariableRegex);
@@ -4029,7 +4029,7 @@ function parse(options) {
     }
     if (url.endsWith("/graphql")) {
       if (options.mediaType.previews?.length) {
-        const previewsFromAcceptHeader = headers.accept.match(/[\w-]+(?=-preview)/g) || [];
+        const previewsFromAcceptHeader = headers.accept.match(/(?<![\w-])[\w-]+(?=-preview)/g) || [];
         headers.accept = previewsFromAcceptHeader.concat(options.mediaType.previews).map((preview) => {
           const format = options.mediaType.format ? `.${options.mediaType.format}` : "+json";
           return `application/vnd.github.${preview}-preview${format}`;
@@ -4278,7 +4278,7 @@ __export(dist_src_exports, {
 module.exports = __toCommonJS(dist_src_exports);
 
 // pkg/dist-src/version.js
-var VERSION = "9.2.1";
+var VERSION = "9.2.2";
 
 // pkg/dist-src/normalize-paginated-list-response.js
 function normalizePaginatedListResponse(response) {
@@ -4326,7 +4326,7 @@ function iterator(octokit, route, parameters) {
           const response = await requestMethod({ method, url, headers });
           const normalizedResponse = normalizePaginatedListResponse(response);
           url = ((normalizedResponse.headers.link || "").match(
-            /<([^>]+)>;\s*rel="next"/
+            /<([^<>]+)>;\s*rel="next"/
           ) || [])[1];
           return { value: normalizedResponse };
         } catch (error) {
@@ -6878,7 +6878,7 @@ var RequestError = class extends Error {
     if (options.request.headers.authorization) {
       requestCopy.headers = Object.assign({}, options.request.headers, {
         authorization: options.request.headers.authorization.replace(
-          / .*$/,
+          /(?<! ) .*$/,
           " [REDACTED]"
         )
       });
@@ -6946,7 +6946,7 @@ var import_endpoint = __nccwpck_require__(4471);
 var import_universal_user_agent = __nccwpck_require__(3843);
 
 // pkg/dist-src/version.js
-var VERSION = "8.4.0";
+var VERSION = "8.4.1";
 
 // pkg/dist-src/is-plain-object.js
 function isPlainObject(value) {
@@ -7005,7 +7005,7 @@ function fetchWrapper(requestOptions) {
       headers[keyAndValue[0]] = keyAndValue[1];
     }
     if ("deprecation" in headers) {
-      const matches = headers.link && headers.link.match(/<([^>]+)>; rel="deprecation"/);
+      const matches = headers.link && headers.link.match(/<([^<>]+)>; rel="deprecation"/);
       const deprecationLink = matches && matches.pop();
       log.warn(
         `[@octokit/request] "${requestOptions.method} ${requestOptions.url}" is deprecated. It is scheduled to be removed on ${headers.sunset}${deprecationLink ? `. See ${deprecationLink}` : ""}`
@@ -32000,6 +32000,7 @@ async function run() {
   const combineBranchName = core.getInput('combine_branch_name')
   const ignoreLabel = core.getInput('ignore_label')
   const selectLabel = core.getInput('select_label')
+  const requiredSourceBase = core.getInput('required_source_base').trim()
   const labels = core.getInput('labels').trim()
   const assignees = core.getInput('assignees').trim()
   const token = core.getInput('github_token', {required: true})
@@ -32059,6 +32060,17 @@ async function run() {
       }
     }
 
+    if (requiredSourceBase && pull.base?.ref !== requiredSourceBase) {
+      core.info(
+        `Discarding ${branch} because its base is not ${requiredSourceBase}`
+      )
+      continue
+    }
+    if (requiredSourceBase && (pull.state !== 'open' || pull.draft !== false)) {
+      core.info(`Discarding ${branch} because it is not an open ready PR`)
+      continue
+    }
+
     // Check labels
     let statusOK = await checkLabels(pull, branch, selectLabel, ignoreLabel)
 
@@ -32068,11 +32080,28 @@ async function run() {
       (await checkStatus(pull, branch, octokit, mustBeGreen, mustBeApproved))
 
     if (statusOK) {
+      if (
+        requiredSourceBase &&
+        (!/^[0-9a-f]{40}$/i.test(pull.head?.sha ?? '') ||
+          pull.head?.repo?.full_name?.toLowerCase() !==
+            `${github.context.repo.owner}/${github.context.repo.repo}`.toLowerCase())
+      ) {
+        core.setFailed(
+          `Selected source PR #${pull.number} has no valid repository head`
+        )
+        return 'failure'
+      }
       core.info('Adding branch to array: ' + branch)
       const prString = `${autoclose ? 'Closes ' : ''}#${pull['number']} ${
         pull['title']
       }`
-      branchesAndPRStrings.push({branch, prString})
+      branchesAndPRStrings.push({
+        branch,
+        prString,
+        number: pull.number,
+        title: pull.title,
+        headSha: pull.head.sha
+      })
       baseBranch = pull['base']['ref']
       baseBranchSHA = pull['base']['sha']
     }
@@ -32096,6 +32125,54 @@ async function run() {
   // previously created draft still needs independent owner-held proof before
   // a caller may treat its later head as admitted.
   const repositoryName = `${github.context.repo.owner}/${github.context.repo.repo}`
+  async function verifySelectedSources() {
+    if (!requiredSourceBase) return true
+    try {
+      for (const source of branchesAndPRStrings) {
+        const {data: current} = await octokit.rest.pulls.get({
+          owner: github.context.repo.owner,
+          repo: github.context.repo.repo,
+          pull_number: source.number
+        })
+        if (
+          current?.number !== source.number ||
+          current.state !== 'open' ||
+          current.draft !== false ||
+          current.title !== source.title ||
+          current.base?.ref !== requiredSourceBase ||
+          current.head?.ref !== source.branch ||
+          current.head?.sha !== source.headSha ||
+          current.head?.repo?.full_name?.toLowerCase() !==
+            repositoryName.toLowerCase() ||
+          !(await checkLabels(
+            current,
+            source.branch,
+            selectLabel,
+            ignoreLabel
+          )) ||
+          !(await checkStatus(
+            current,
+            source.branch,
+            octokit,
+            mustBeGreen,
+            mustBeApproved
+          ))
+        ) {
+          core.setFailed(
+            `Selected source PR #${source.number} changed or is ineligible`
+          )
+          return false
+        }
+      }
+    } catch (error) {
+      core.error(error)
+      core.setFailed('Could not revalidate selected source PRs')
+      return false
+    }
+    return true
+  }
+
+  if (!(await verifySelectedSources())) return 'failure'
   const existingCombinedPRs = pulls.filter(
     pull =>
       pull.head?.ref === combineBranchName &&
@@ -32145,7 +32222,10 @@ async function run() {
     return 'failure'
   }
 
-  const stagesCombinedHead = createFromScratch || Boolean(existingCombinedPR)
+  const stagesCombinedHead =
+    createFromScratch ||
+    Boolean(existingCombinedPR) ||
+    Boolean(requiredSourceBase)
   const workingRef = stagesCombinedHead
     ? `combine-prs-working/${(0,external_node_crypto_namespaceObject.randomUUID)()}`
     : combineBranchName
@@ -32197,13 +32277,13 @@ async function run() {
     }
 
     // Merge all branches into the working ref.
-    for (const {branch, prString} of branchesAndPRStrings) {
+    for (const {branch, prString, headSha} of branchesAndPRStrings) {
       try {
         const mergeResult = await octokit.rest.repos.merge({
           owner: github.context.repo.owner,
           repo: github.context.repo.repo,
           base: workingRef,
-          head: branch
+          head: requiredSourceBase ? headSha : branch
         })
         if (existingCombinedPR && !createFromScratch) {
           if (
@@ -32229,6 +32309,7 @@ async function run() {
     }
 
     if (stagesCombinedHead) {
+      if (!(await verifySelectedSources())) return 'failure'
       // Get the updated ref of the working branch
       const {
         data: {object: workingRefObject}

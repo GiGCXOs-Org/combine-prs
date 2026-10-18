@@ -46,6 +46,7 @@ beforeEach(() => {
   process.env.INPUT_BRANCH_PREFIX = 'dependabot'
   process.env.INPUT_IGNORE_LABEL = 'nocombine'
   process.env.INPUT_SELECT_LABEL = ''
+  process.env.INPUT_REQUIRED_SOURCE_BASE = ''
   process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
   process.env.INPUT_MIN_COMBINE_NUMBER = '2'
   process.env.INPUT_LABELS = ''
@@ -2576,6 +2577,159 @@ test('successfully runs the action and sets assignees', async () => {
   )
 
   expect(setOutputMock).toHaveBeenCalledWith('pr_number', 100)
+})
+
+async function runRequiredSourceBaseCase(configure = () => {}) {
+  process.env.INPUT_REQUIRED_SOURCE_BASE = 'develop'
+  process.env.INPUT_CI_REQUIRED = 'false'
+  process.env.INPUT_UPDATE_BRANCH = 'false'
+  const original = github.getOctokit.getMockImplementation()
+  let client
+  github.getOctokit.mockImplementation(() => {
+    client = original()
+    const sources = [
+      buildPR(1, 'dependabot-1', [], 'develop'),
+      buildPR(2, 'dependabot-2', [], 'develop')
+    ]
+    client.paginate.mockReturnValue(sources)
+    client.rest.pulls.get = jest.fn(({pull_number}) => ({
+      data: sources.find(source => source.number === pull_number)
+    }))
+    client.rest.repos.merge = jest.fn().mockResolvedValue({status: 204})
+    client.rest.git.getRef = jest.fn().mockResolvedValue({
+      data: {object: {sha: 'c'.repeat(40)}}
+    })
+    client.rest.git.deleteRef = jest.fn().mockResolvedValue({})
+    configure(client, sources)
+    return client
+  })
+  const result = await run()
+  return {result, client}
+}
+
+test('required source base excludes a wrong-base PR before branch work', async () => {
+  const {result, client} = await runRequiredSourceBaseCase((_, sources) => {
+    sources[1].base.ref = 'release'
+  })
+  expect(result).toBe(
+    'not enough PRs/branches matched criteria to create a combined PR'
+  )
+  expect(client.rest.git.createRef).not.toHaveBeenCalled()
+})
+
+test('required source base excludes a newly drafted source', async () => {
+  const {result, client} = await runRequiredSourceBaseCase((_, sources) => {
+    sources[1].draft = true
+  })
+  expect(result).toBe(
+    'not enough PRs/branches matched criteria to create a combined PR'
+  )
+  expect(client.rest.git.createRef).not.toHaveBeenCalled()
+})
+
+test('required source base rejects a selected source without a repository head', async () => {
+  const {result, client} = await runRequiredSourceBaseCase((_, sources) => {
+    sources[0].head.sha = 'invalid'
+  })
+  expect(result).toBe('failure')
+  expect(client.rest.git.createRef).not.toHaveBeenCalled()
+})
+
+test('required source base rejects a selected source from another repository', async () => {
+  const {result, client} = await runRequiredSourceBaseCase((_, sources) => {
+    sources[0].head.repo.full_name = 'another/repository'
+  })
+  expect(result).toBe('failure')
+  expect(client.rest.git.createRef).not.toHaveBeenCalled()
+})
+
+test('required source base merges observed SHAs only after source revalidation', async () => {
+  const {result, client} = await runRequiredSourceBaseCase()
+  expect(result).toBe('success')
+  expect(client.rest.pulls.get).toHaveBeenCalledTimes(4)
+  expect(client.rest.repos.merge).toHaveBeenCalledTimes(2)
+  expect(client.rest.repos.merge).toHaveBeenCalledWith(
+    expect.objectContaining({head: 'a'.repeat(40)})
+  )
+  expect(client.rest.git.deleteRef).toHaveBeenCalledTimes(1)
+  expect(client.graphql).toHaveBeenCalledWith(
+    expect.stringContaining('updateRefs'),
+    expect.anything()
+  )
+})
+
+test('required source base blocks retarget before creating a branch', async () => {
+  const {result, client} = await runRequiredSourceBaseCase(
+    (mockClient, sources) => {
+      const retargeted = {...sources[0], base: {ref: 'release'}}
+      mockClient.rest.pulls.get.mockResolvedValueOnce({data: retargeted})
+    }
+  )
+  expect(result).toBe('failure')
+  expect(client.rest.git.createRef).not.toHaveBeenCalled()
+  expect(client.rest.repos.merge).not.toHaveBeenCalled()
+})
+
+test('required source base blocks retarget before publishing the combined head', async () => {
+  const {result, client} = await runRequiredSourceBaseCase(
+    (mockClient, sources) => {
+      const retargeted = {...sources[0], base: {ref: 'release'}}
+      mockClient.rest.pulls.get
+        .mockResolvedValueOnce({data: sources[0]})
+        .mockResolvedValueOnce({data: sources[1]})
+        .mockResolvedValueOnce({data: retargeted})
+    }
+  )
+  expect(result).toBe('failure')
+  expect(client.rest.repos.merge).toHaveBeenCalledTimes(2)
+  expect(client.graphql).not.toHaveBeenCalledWith(
+    expect.stringContaining('updateRefs'),
+    expect.anything()
+  )
+  expect(client.rest.git.deleteRef).toHaveBeenCalledTimes(1)
+})
+
+test('required source base blocks a changed source head or exclusion label', async () => {
+  const changed = await runRequiredSourceBaseCase((client, sources) => {
+    const moved = {
+      ...sources[0],
+      head: {...sources[0].head, sha: 'd'.repeat(40)}
+    }
+    client.rest.pulls.get.mockResolvedValueOnce({data: moved})
+  })
+  expect(changed.result).toBe('failure')
+  expect(changed.client.rest.git.createRef).not.toHaveBeenCalled()
+  const excluded = await runRequiredSourceBaseCase((client, sources) => {
+    const labeled = {...sources[0], labels: [{name: 'nocombine'}]}
+    client.rest.pulls.get.mockResolvedValueOnce({data: labeled})
+  })
+  expect(excluded.result).toBe('failure')
+  expect(excluded.client.rest.git.createRef).not.toHaveBeenCalled()
+})
+
+test('required source base blocks a newly drafted or retitled source', async () => {
+  const drafted = await runRequiredSourceBaseCase((client, sources) => {
+    client.rest.pulls.get.mockResolvedValueOnce({
+      data: {...sources[0], draft: true}
+    })
+  })
+  expect(drafted.result).toBe('failure')
+  expect(drafted.client.rest.git.createRef).not.toHaveBeenCalled()
+  const retitled = await runRequiredSourceBaseCase((client, sources) => {
+    client.rest.pulls.get.mockResolvedValueOnce({
+      data: {...sources[0], title: 'WIP'}
+    })
+  })
+  expect(retitled.result).toBe('failure')
+  expect(retitled.client.rest.git.createRef).not.toHaveBeenCalled()
+})
+
+test('required source base fails closed when a source read fails', async () => {
+  const {result, client} = await runRequiredSourceBaseCase(mockClient => {
+    mockClient.rest.pulls.get.mockRejectedValueOnce(new Error('unavailable'))
+  })
+  expect(result).toBe('failure')
+  expect(client.rest.git.createRef).not.toHaveBeenCalled()
 })
 
 function buildStatusResponse(reviewDecision, ciStatus) {

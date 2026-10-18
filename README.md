@@ -28,6 +28,7 @@ As mentioned above is this README, a core reason why this Action exists is to "c
 | `pr_body_header` | The header of the pull request body | `# Combined PRs ➡️📦⬅️` | `true` |
 | `min_combine_number` | The minimum number of PRs that have to match criteria in order to create a combined PR | `"2"` | `true` |
 | `branch_regex` | The regex to match the branches to combine - more control than branch_prefix | `""` | `false` |
+| `required_source_base` | If set, select only open, ready source PRs targeting this base; recheck base, title, labels, head, and checks before publishing; merge the observed commit SHA | `""` | `false` |
 | `ci_required` | Whether or not CI should be passing to combine the PR - can be `"true"` or `"false"`  | `"true"` | `true` |
 | `review_required` | Whether or not reviews should be passing to combine the PR - can be `"true"` or `"false"` | `"false"` | `false` |
 | `ignore_label` | The label to ignore when combining PRs | `"nocombine"` | `true` |

@@ -29,6 +29,10 @@ inputs:
     description: The regex to match the branches to combine - more control than branch_prefix
     required: false
     default: ""
+  required_source_base:
+    description: If set, combine only source PRs targeting this base and revalidate them before publishing
+    required: false
+    default: ""
   ci_required:
     description: Whether or not CI should be passing to combine the PR
     required: true
