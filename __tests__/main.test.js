@@ -2646,6 +2646,12 @@ test('required source base rejects a selected source from another repository', a
 test('required source base merges observed SHAs only after source revalidation', async () => {
   const {result, client} = await runRequiredSourceBaseCase()
   expect(result).toBe('success')
+  expect(client.rest.git.createRef).toHaveBeenCalledWith(
+    expect.objectContaining({
+      ref: expect.stringMatching(/^refs\/heads\/combine-prs-working\//),
+      sha: 'b'.repeat(40)
+    })
+  )
   expect(client.rest.pulls.get).toHaveBeenCalledTimes(4)
   expect(client.rest.repos.merge).toHaveBeenCalledTimes(2)
   expect(client.rest.repos.merge).toHaveBeenCalledWith(

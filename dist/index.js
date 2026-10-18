@@ -32238,7 +32238,9 @@ async function run() {
         owner: github.context.repo.owner,
         repo: github.context.repo.repo,
         ref: 'refs/heads/' + workingRef,
-        sha: createFromScratch ? baseBranchSHA : existingHeadSha
+        sha: createFromScratch
+          ? baseBranchSHA
+          : (existingHeadSha ?? baseBranchSHA)
       })
     } catch (error) {
       // Otherwise, fail the Action
