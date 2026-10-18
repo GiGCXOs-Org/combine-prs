@@ -32215,12 +32215,13 @@ async function run() {
       if (existingCombinedPR && !createFromScratch) {
         if (
           mergeResult?.status === 201 &&
-          /^[0-9a-f]{40}$/i.test(mergeResult.data?.sha ?? '')
+          /^[0-9a-f]{40}$/i.test(mergeResult.data?.sha ?? '') &&
+          mergeResult.data?.parents?.[0]?.sha === expectedCombinedHeadAfterMerge
         ) {
           expectedCombinedHeadAfterMerge = mergeResult.data.sha
         } else if (mergeResult?.status !== 204) {
           core.setFailed(
-            'Combined branch merge returned no verifiable head SHA'
+            'Combined branch merge returned no verifiable head SHA or parent'
           )
           return 'failure'
         }

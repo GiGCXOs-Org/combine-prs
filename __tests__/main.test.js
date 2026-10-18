@@ -581,7 +581,10 @@ test('runs the action and finds the combine branch already exists and the PR als
         repos: {
           merge: jest
             .fn()
-            .mockResolvedValueOnce({status: 201, data: {sha: mergedSha}})
+            .mockResolvedValueOnce({
+              status: 201,
+              data: {sha: mergedSha, parents: [{sha: 'a'.repeat(40)}]}
+            })
             .mockResolvedValue({status: 204})
         },
         pulls: {
@@ -673,7 +676,10 @@ async function runDefaultExistingCase(configureClient) {
       .mockRejectedValue(new AlreadyExistsError('Reference already exists'))
     client.rest.repos.merge = jest
       .fn()
-      .mockResolvedValueOnce({status: 201, data: {sha: 'c'.repeat(40)}})
+      .mockResolvedValueOnce({
+        status: 201,
+        data: {sha: 'c'.repeat(40), parents: [{sha: 'a'.repeat(40)}]}
+      })
       .mockResolvedValue({status: 204})
     client.rest.git.getRef = jest.fn().mockResolvedValue({
       data: {object: {sha: 'c'.repeat(40)}}
@@ -728,6 +734,74 @@ test('rejects a default-mode PR head changed after ref verification', async () =
   expect(client.rest.pulls.update).not.toHaveBeenCalled()
 })
 
+test('rejects a default-mode merge built on an intervening branch push', async () => {
+  const {result, client} = await runDefaultExistingCase(client => {
+    client.rest.repos.merge.mockReset().mockResolvedValueOnce({
+      status: 201,
+      data: {sha: 'c'.repeat(40), parents: [{sha: 'd'.repeat(40)}]}
+    })
+  })
+
+  expect(result).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Combined branch merge returned no verifiable head SHA or parent'
+  )
+  expect(client.rest.git.getRef).not.toHaveBeenCalled()
+  expect(client.rest.pulls.update).not.toHaveBeenCalled()
+})
+
+test('verifies each parent across consecutive default-mode merges', async () => {
+  const {result, client} = await runDefaultExistingCase(client => {
+    client.rest.repos.merge
+      .mockReset()
+      .mockResolvedValueOnce({
+        status: 201,
+        data: {sha: 'c'.repeat(40), parents: [{sha: 'a'.repeat(40)}]}
+      })
+      .mockResolvedValueOnce({
+        status: 201,
+        data: {sha: 'e'.repeat(40), parents: [{sha: 'c'.repeat(40)}]}
+      })
+    client.rest.git.getRef.mockResolvedValue({
+      data: {object: {sha: 'e'.repeat(40)}}
+    })
+    const after = buildPR(100, 'combined-prs-branch', [], 'main', true)
+    after.head.sha = 'e'.repeat(40)
+    client.rest.pulls.get
+      .mockReset()
+      .mockResolvedValueOnce({
+        data: buildPR(100, 'combined-prs-branch', [], 'main', true)
+      })
+      .mockResolvedValueOnce({data: after})
+  })
+
+  expect(result).toBe('success')
+  expect(client.rest.repos.merge).toHaveBeenCalledTimes(2)
+  expect(client.rest.pulls.update).toHaveBeenCalledTimes(1)
+})
+
+test('rejects a push between consecutive default-mode merges', async () => {
+  const {result, client} = await runDefaultExistingCase(client => {
+    client.rest.repos.merge
+      .mockReset()
+      .mockResolvedValueOnce({
+        status: 201,
+        data: {sha: 'c'.repeat(40), parents: [{sha: 'a'.repeat(40)}]}
+      })
+      .mockResolvedValueOnce({
+        status: 201,
+        data: {sha: 'e'.repeat(40), parents: [{sha: 'd'.repeat(40)}]}
+      })
+  })
+
+  expect(result).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Combined branch merge returned no verifiable head SHA or parent'
+  )
+  expect(client.rest.git.getRef).not.toHaveBeenCalled()
+  expect(client.rest.pulls.update).not.toHaveBeenCalled()
+})
+
 test('rejects incomplete default-mode merge evidence', async () => {
   const {result, client} = await runDefaultExistingCase(client => {
     client.rest.repos.merge
@@ -737,7 +811,23 @@ test('rejects incomplete default-mode merge evidence', async () => {
 
   expect(result).toBe('failure')
   expect(setFailedMock).toHaveBeenCalledWith(
-    'Combined branch merge returned no verifiable head SHA'
+    'Combined branch merge returned no verifiable head SHA or parent'
+  )
+  expect(client.rest.git.getRef).not.toHaveBeenCalled()
+  expect(client.rest.pulls.update).not.toHaveBeenCalled()
+})
+
+test('rejects a default-mode merge without its parent', async () => {
+  const {result, client} = await runDefaultExistingCase(client => {
+    client.rest.repos.merge.mockReset().mockResolvedValueOnce({
+      status: 201,
+      data: {sha: 'c'.repeat(40)}
+    })
+  })
+
+  expect(result).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Combined branch merge returned no verifiable head SHA or parent'
   )
   expect(client.rest.git.getRef).not.toHaveBeenCalled()
   expect(client.rest.pulls.update).not.toHaveBeenCalled()
