@@ -163,6 +163,7 @@ export async function run() {
 
   let workingRef = combineBranchName
   let combinedHeadAfterScratch
+  let expectedCombinedHeadAfterMerge = existingCombinedPR?.head?.sha
   if (createFromScratch) {
     workingRef = combineBranchName + '-working'
 
@@ -224,12 +225,25 @@ export async function run() {
   let mergeFailedPRs = []
   for (const {branch, prString} of branchesAndPRStrings) {
     try {
-      await octokit.rest.repos.merge({
+      const mergeResult = await octokit.rest.repos.merge({
         owner: context.repo.owner,
         repo: context.repo.repo,
         base: workingRef,
         head: branch
       })
+      if (existingCombinedPR && !createFromScratch) {
+        if (
+          mergeResult?.status === 201 &&
+          /^[0-9a-f]{40}$/i.test(mergeResult.data?.sha ?? '')
+        ) {
+          expectedCombinedHeadAfterMerge = mergeResult.data.sha
+        } else if (mergeResult?.status !== 204) {
+          core.setFailed(
+            'Combined branch merge returned no verifiable head SHA'
+          )
+          return 'failure'
+        }
+      }
       core.info('Merged branch ' + branch)
       combinedPRs.push(prString)
     } catch (error) {
@@ -301,6 +315,16 @@ export async function run() {
       repo: context.repo.repo,
       ref: 'heads/' + workingRef
     })
+  } else if (existingCombinedPR) {
+    const {data: combinedRef} = await octokit.rest.git.getRef({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      ref: 'heads/' + combineBranchName
+    })
+    if (combinedRef?.object?.sha !== expectedCombinedHeadAfterMerge) {
+      core.setFailed('Combined branch changed after source merges')
+      return 'failure'
+    }
   }
 
   // Create a new PR with the combined branch
@@ -321,7 +345,9 @@ export async function run() {
   let pullRequest
   let prOrigin
   if (existingCombinedPR) {
-    const pr = await readCurrentCombinedPR(combinedHeadAfterScratch)
+    const pr = await readCurrentCombinedPR(
+      combinedHeadAfterScratch ?? expectedCombinedHeadAfterMerge
+    )
     if (!pr) return 'failure'
     await octokit.rest.pulls.update({
       owner: context.repo.owner,
