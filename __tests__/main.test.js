@@ -552,8 +552,10 @@ test('runs the action and finds the combine branch already exists and the PR als
           buildPR(100, 'combined-prs-branch', [], 'main', true)
         ]
       }),
-      graphql: jest.fn().mockImplementation(() => {
-        return buildStatusResponse('APPROVED', 'SUCCESS')
+      graphql: jest.fn().mockImplementation((_query, params) => {
+        return params.input?.refUpdates
+          ? {updateRefs: {clientMutationId: null}}
+          : buildStatusResponse('APPROVED', 'SUCCESS')
       }),
       rest: {
         issues: {
@@ -562,11 +564,8 @@ test('runs the action and finds the combine branch already exists and the PR als
           })
         },
         git: {
-          createRef: jest
-            .fn()
-            .mockRejectedValueOnce(
-              new AlreadyExistsError('Reference already exists')
-            ),
+          createRef: jest.fn().mockResolvedValue({data: {}}),
+          deleteRef: jest.fn().mockResolvedValue({data: {}}),
           updateRef: jest.fn().mockReturnValueOnce({
             data: {}
           }),
@@ -579,6 +578,9 @@ test('runs the action and finds the combine branch already exists and the PR als
           })
         },
         repos: {
+          get: jest.fn().mockResolvedValue({
+            data: {node_id: 'test-repository-node-id'}
+          }),
           merge: jest
             .fn()
             .mockResolvedValueOnce({
@@ -591,6 +593,9 @@ test('runs the action and finds the combine branch already exists and the PR als
           create: jest.fn(),
           get: jest
             .fn()
+            .mockResolvedValueOnce({
+              data: buildPR(100, 'combined-prs-branch', [], 'main', true)
+            })
             .mockResolvedValueOnce({
               data: buildPR(100, 'combined-prs-branch', [], 'main', true)
             })
@@ -612,18 +617,42 @@ test('runs the action and finds the combine branch already exists and the PR als
     }
   })
 
-  expect(await run()).toBe('success')
-  expect(warningMock).toHaveBeenCalledWith(
+  const result = await run()
+  expect(setFailedMock.mock.calls).toEqual([])
+  expect(result).toBe('success')
+  expect(warningMock).not.toHaveBeenCalledWith(
     'Branch already exists - will try to merge into it'
   )
   expect(setOutputMock).toHaveBeenCalledWith('pr_number', 100)
   expect(setOutputMock).toHaveBeenCalledWith('pr_origin', 'existing')
   const client = github.getOctokit.mock.results[0].value
-  expect(client.rest.pulls.get).toHaveBeenCalledTimes(2)
+  expect(client.rest.pulls.get).toHaveBeenCalledTimes(3)
   expect(client.rest.git.getRef).toHaveBeenCalledWith(
-    expect.objectContaining({ref: 'heads/combined-prs-branch'})
+    expect.objectContaining({
+      ref: expect.stringMatching(/^heads\/combine-prs-working\//)
+    })
   )
   expect(client.rest.pulls.create).not.toHaveBeenCalled()
+})
+
+test('keeps default-mode handling of a combined branch without a PR', async () => {
+  const original = github.getOctokit.getMockImplementation()
+  let client
+  github.getOctokit.mockImplementation(() => {
+    client = original()
+    client.rest.git.createRef = jest
+      .fn()
+      .mockRejectedValueOnce(new AlreadyExistsError('Reference already exists'))
+    return client
+  })
+
+  expect(await run()).toBe('success')
+  expect(warningMock).toHaveBeenCalledWith(
+    'Branch already exists - will try to merge into it'
+  )
+  expect(client.rest.repos.merge).toHaveBeenCalledWith(
+    expect.objectContaining({base: 'combined-prs-branch'})
+  )
 })
 
 test('rejects an existing PR that becomes ready before its body update', async () => {
@@ -671,9 +700,8 @@ async function runDefaultExistingCase(configureClient) {
       buildPR(2, 'dependabot-2'),
       buildPR(100, 'combined-prs-branch', [], 'main', true)
     ])
-    client.rest.git.createRef = jest
-      .fn()
-      .mockRejectedValue(new AlreadyExistsError('Reference already exists'))
+    client.rest.git.createRef = jest.fn().mockResolvedValue({data: {}})
+    client.rest.git.deleteRef = jest.fn().mockResolvedValue({data: {}})
     client.rest.repos.merge = jest
       .fn()
       .mockResolvedValueOnce({
@@ -689,6 +717,9 @@ async function runDefaultExistingCase(configureClient) {
     after.html_url = 'https://github.com/test-owner/test-repo/pull/100'
     client.rest.pulls.get = jest
       .fn()
+      .mockResolvedValueOnce({
+        data: buildPR(100, 'combined-prs-branch', [], 'main', true)
+      })
       .mockResolvedValueOnce({
         data: buildPR(100, 'combined-prs-branch', [], 'main', true)
       })
@@ -709,9 +740,13 @@ test('rejects a default-mode branch changed after source merges', async () => {
 
   expect(result).toBe('failure')
   expect(setFailedMock).toHaveBeenCalledWith(
-    'Combined branch changed after source merges'
+    'Staged combined branch changed after source merges'
   )
   expect(client.rest.pulls.get).toHaveBeenCalledTimes(1)
+  expect(client.graphql).not.toHaveBeenCalledWith(
+    expect.stringContaining('updateRefs'),
+    expect.anything()
+  )
   expect(client.rest.pulls.update).not.toHaveBeenCalled()
 })
 
@@ -724,6 +759,9 @@ test('rejects a default-mode PR head changed after ref verification', async () =
       .mockResolvedValueOnce({
         data: buildPR(100, 'combined-prs-branch', [], 'main', true)
       })
+      .mockResolvedValueOnce({
+        data: buildPR(100, 'combined-prs-branch', [], 'main', true)
+      })
       .mockResolvedValueOnce({data: changed})
   })
 
@@ -731,6 +769,54 @@ test('rejects a default-mode PR head changed after ref verification', async () =
   expect(setFailedMock).toHaveBeenCalledWith(
     'Existing combined PR changed or is not draft'
   )
+  expect(client.rest.pulls.update).not.toHaveBeenCalled()
+})
+
+test('does not publish default-mode staging after its draft becomes ready', async () => {
+  const {result, client} = await runDefaultExistingCase(client => {
+    client.rest.pulls.get
+      .mockReset()
+      .mockResolvedValueOnce({
+        data: buildPR(100, 'combined-prs-branch', [], 'main', true)
+      })
+      .mockResolvedValueOnce({
+        data: buildPR(100, 'combined-prs-branch', [], 'main', false)
+      })
+  })
+
+  expect(result).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Existing combined PR changed or is not draft'
+  )
+  expect(client.graphql).not.toHaveBeenCalledWith(
+    expect.stringContaining('updateRefs'),
+    expect.anything()
+  )
+  expect(client.rest.git.deleteRef).toHaveBeenCalledTimes(1)
+  expect(client.rest.pulls.update).not.toHaveBeenCalled()
+})
+
+test('preserves a concurrent live branch update during default-mode staging', async () => {
+  const {result, client} = await runDefaultExistingCase(client => {
+    const originalGraphql = client.graphql.getMockImplementation()
+    client.graphql.mockImplementation((query, params) => {
+      if (params.input?.refUpdates) {
+        throw new Error('beforeOid no longer matches')
+      }
+      return originalGraphql(query, params)
+    })
+  })
+
+  expect(result).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Combined branch changed before conditional update'
+  )
+  expect(client.rest.repos.merge).toHaveBeenCalledWith(
+    expect.objectContaining({
+      base: expect.stringMatching(/^combine-prs-working\//)
+    })
+  )
+  expect(client.rest.git.deleteRef).toHaveBeenCalledTimes(1)
   expect(client.rest.pulls.update).not.toHaveBeenCalled()
 })
 
@@ -769,6 +855,9 @@ test('verifies each parent across consecutive default-mode merges', async () => 
     after.head.sha = 'e'.repeat(40)
     client.rest.pulls.get
       .mockReset()
+      .mockResolvedValueOnce({
+        data: buildPR(100, 'combined-prs-branch', [], 'main', true)
+      })
       .mockResolvedValueOnce({
         data: buildPR(100, 'combined-prs-branch', [], 'main', true)
       })
@@ -814,6 +903,7 @@ test('rejects incomplete default-mode merge evidence', async () => {
     'Combined branch merge returned no verifiable head SHA or parent'
   )
   expect(client.rest.git.getRef).not.toHaveBeenCalled()
+  expect(client.rest.git.deleteRef).toHaveBeenCalledTimes(1)
   expect(client.rest.pulls.update).not.toHaveBeenCalled()
 })
 
@@ -831,6 +921,42 @@ test('rejects a default-mode merge without its parent', async () => {
   )
   expect(client.rest.git.getRef).not.toHaveBeenCalled()
   expect(client.rest.pulls.update).not.toHaveBeenCalled()
+})
+
+test('stages an existing default-mode PR before conditional publication', async () => {
+  const {result, client} = await runDefaultExistingCase(() => {})
+
+  expect(result).toBe('success')
+  expect(client.rest.git.createRef).toHaveBeenCalledWith(
+    expect.objectContaining({
+      ref: expect.stringMatching(/^refs\/heads\/combine-prs-working\//),
+      sha: 'a'.repeat(40)
+    })
+  )
+  expect(client.rest.repos.merge).toHaveBeenCalledWith(
+    expect.objectContaining({
+      base: expect.stringMatching(/^combine-prs-working\//)
+    })
+  )
+  expect(client.graphql).toHaveBeenCalledWith(
+    expect.stringContaining('updateRefs'),
+    expect.objectContaining({
+      input: expect.objectContaining({
+        refUpdates: [
+          expect.objectContaining({
+            beforeOid: 'a'.repeat(40),
+            afterOid: 'c'.repeat(40),
+            force: false
+          })
+        ]
+      })
+    })
+  )
+  expect(client.rest.git.deleteRef).toHaveBeenCalledWith(
+    expect.objectContaining({
+      ref: client.rest.git.createRef.mock.calls[0][0].ref.replace('refs/', '')
+    })
+  )
 })
 
 test('rejects a PR that becomes ready before any branch change', async () => {
@@ -1923,12 +2049,12 @@ test('successfully runs the action and uses a fresh pull request branch', async 
 
   expect(createRef).toHaveBeenCalledWith(
     expect.objectContaining({
-      ref: expect.stringContaining('refs/heads/combined-prs-branch-working')
+      ref: expect.stringMatching(/^refs\/heads\/combine-prs-working\//)
     })
   )
   expect(getRef).toHaveBeenCalledWith(
     expect.objectContaining({
-      ref: expect.stringContaining('heads/combined-prs-branch-working')
+      ref: expect.stringMatching(/^heads\/combine-prs-working\//)
     })
   )
   const client = github.getOctokit.mock.results[0].value
@@ -1951,7 +2077,7 @@ test('successfully runs the action and uses a fresh pull request branch', async 
   )
   expect(deleteRef).toHaveBeenCalledWith(
     expect.objectContaining({
-      ref: expect.stringContaining('heads/combined-prs-branch-working')
+      ref: expect.stringMatching(/^heads\/combine-prs-working\//)
     })
   )
 
@@ -2121,6 +2247,7 @@ test('keeps an existing draft after a conditional scratch replacement', async ()
     client.rest.pulls.get = jest
       .fn()
       .mockResolvedValueOnce({data: before})
+      .mockResolvedValueOnce({data: before})
       .mockResolvedValueOnce({data: after})
     client.rest.pulls.update = jest.fn().mockResolvedValue({data: after})
   })
@@ -2136,6 +2263,65 @@ test('keeps an existing draft after a conditional scratch replacement', async ()
   )
   expect(client.rest.pulls.update).toHaveBeenCalledTimes(1)
   expect(setOutputMock).toHaveBeenCalledWith('pr_origin', 'existing')
+})
+
+test('does not publish a scratch branch after its draft becomes ready', async () => {
+  const {result, client} = await runScratchCase(client => {
+    client.paginate.mockReturnValue([
+      buildPR(1, 'dependabot-1'),
+      buildPR(2, 'dependabot-2'),
+      buildPR(100, 'combined-prs-branch', [], 'main', true)
+    ])
+    client.rest.pulls.get = jest
+      .fn()
+      .mockResolvedValueOnce({
+        data: buildPR(100, 'combined-prs-branch', [], 'main', true)
+      })
+      .mockResolvedValue({
+        data: buildPR(100, 'combined-prs-branch', [], 'main', false)
+      })
+    client.rest.pulls.update = jest.fn()
+  })
+
+  expect(result).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Existing combined PR changed or is not draft'
+  )
+  expect(client.graphql).not.toHaveBeenCalledWith(
+    expect.stringContaining('updateRefs'),
+    expect.anything()
+  )
+  expect(client.rest.pulls.update).not.toHaveBeenCalled()
+})
+
+test('does not publish a scratch branch after its draft is retargeted', async () => {
+  const {result, client} = await runScratchCase(client => {
+    client.paginate.mockReturnValue([
+      buildPR(1, 'dependabot-1'),
+      buildPR(2, 'dependabot-2'),
+      buildPR(100, 'combined-prs-branch', [], 'main', true)
+    ])
+    client.rest.pulls.get = jest
+      .fn()
+      .mockResolvedValueOnce({
+        data: buildPR(100, 'combined-prs-branch', [], 'main', true)
+      })
+      .mockResolvedValueOnce({
+        data: buildPR(100, 'combined-prs-branch', [], 'release', true)
+      })
+    client.rest.pulls.update = jest.fn()
+  })
+
+  expect(result).toBe('failure')
+  expect(setFailedMock).toHaveBeenCalledWith(
+    'Existing combined PR changed or is not draft'
+  )
+  expect(client.graphql).not.toHaveBeenCalledWith(
+    expect.stringContaining('updateRefs'),
+    expect.anything()
+  )
+  expect(client.rest.git.deleteRef).toHaveBeenCalledTimes(1)
+  expect(client.rest.pulls.update).not.toHaveBeenCalled()
 })
 
 test('successfully runs the action and uses the existing pull request branch', async () => {

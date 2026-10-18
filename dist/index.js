@@ -31854,6 +31854,8 @@ __nccwpck_require__.d(__webpack_exports__, {
 var core = __nccwpck_require__(7484);
 // EXTERNAL MODULE: ./node_modules/@actions/github/lib/github.js
 var github = __nccwpck_require__(3228);
+;// CONCATENATED MODULE: external "node:crypto"
+const external_node_crypto_namespaceObject = require("node:crypto");
 ;// CONCATENATED MODULE: ./src/functions/check-labels.js
 
 
@@ -31979,6 +31981,7 @@ async function checkStatus(
 }
 
 ;// CONCATENATED MODULE: ./src/main.js
+
 
 
 
@@ -32142,32 +32145,20 @@ async function run() {
     return 'failure'
   }
 
-  let workingRef = combineBranchName
-  let combinedHeadAfterScratch
+  const stagesCombinedHead = createFromScratch || Boolean(existingCombinedPR)
+  const workingRef = stagesCombinedHead
+    ? `combine-prs-working/${(0,external_node_crypto_namespaceObject.randomUUID)()}`
+    : combineBranchName
+  let combinedHeadAfterStaging
   let expectedCombinedHeadAfterMerge = existingCombinedPR?.head?.sha
-  if (createFromScratch) {
-    workingRef = combineBranchName + '-working'
-
-    // delete any pre-existing working branch
-    try {
-      await octokit.rest.git.deleteRef({
-        owner: github.context.repo.owner,
-        repo: github.context.repo.repo,
-        ref: 'heads/' + workingRef
-      })
-    } catch (error) {
-      // If the branch doesn't exist, that's fine
-      // istanbul ignore next
-      core.debug(`branch ${workingRef} not found - OK`)
-    }
-
-    // create our working branch
+  if (stagesCombinedHead) {
+    // Each run owns a separate staging ref. Never reset another run's ref.
     try {
       await octokit.rest.git.createRef({
         owner: github.context.repo.owner,
         repo: github.context.repo.repo,
         ref: 'refs/heads/' + workingRef,
-        sha: baseBranchSHA
+        sha: createFromScratch ? baseBranchSHA : existingHeadSha
       })
     } catch (error) {
       // Otherwise, fail the Action
@@ -32177,135 +32168,150 @@ async function run() {
     }
   }
 
-  // Create a new branch
-  try {
-    await octokit.rest.git.createRef({
-      owner: github.context.repo.owner,
-      repo: github.context.repo.repo,
-      ref: 'refs/heads/' + combineBranchName,
-      sha: baseBranchSHA
-    })
-  } catch (error) {
-    // If the branch already exists, we'll try to merge into it
-    if (error.status == 422) {
-      if (createFromScratch && !existingCombinedPR) {
-        core.setFailed('Combined branch exists without a matching draft PR')
-        return 'failure'
-      }
-      core.warning('Branch already exists - will try to merge into it')
-    } else {
-      // Otherwise, fail the Action
-      core.error(error)
-      core.setFailed('Failed to create combined branch')
-      return 'Failed to create combined branch'
-    }
-  }
-
-  // Merge all branches into the new branch
   let combinedPRs = []
   let mergeFailedPRs = []
-  for (const {branch, prString} of branchesAndPRStrings) {
-    try {
-      const mergeResult = await octokit.rest.repos.merge({
-        owner: github.context.repo.owner,
-        repo: github.context.repo.repo,
-        base: workingRef,
-        head: branch
-      })
-      if (existingCombinedPR && !createFromScratch) {
-        if (
-          mergeResult?.status === 201 &&
-          /^[0-9a-f]{40}$/i.test(mergeResult.data?.sha ?? '') &&
-          mergeResult.data?.parents?.[0]?.sha === expectedCombinedHeadAfterMerge
-        ) {
-          expectedCombinedHeadAfterMerge = mergeResult.data.sha
-        } else if (mergeResult?.status !== 204) {
-          core.setFailed(
-            'Combined branch merge returned no verifiable head SHA or parent'
-          )
-          return 'failure'
+  try {
+    // An existing PR's live branch must not change until publication.
+    if (!existingCombinedPR) {
+      try {
+        await octokit.rest.git.createRef({
+          owner: github.context.repo.owner,
+          repo: github.context.repo.repo,
+          ref: 'refs/heads/' + combineBranchName,
+          sha: baseBranchSHA
+        })
+      } catch (error) {
+        // If the branch already exists, we'll try to merge into it.
+        if (error.status == 422) {
+          if (createFromScratch) {
+            core.setFailed('Combined branch exists without a matching draft PR')
+            return 'failure'
+          }
+          core.warning('Branch already exists - will try to merge into it')
+        } else {
+          core.error(error)
+          core.setFailed('Failed to create combined branch')
+          return 'Failed to create combined branch'
         }
       }
-      core.info('Merged branch ' + branch)
-      combinedPRs.push(prString)
-    } catch (error) {
-      core.warning('Failed to merge branch ' + branch)
-      mergeFailedPRs.push(prString.replace('Closes ', ''))
     }
-  }
 
-  if (createFromScratch) {
-    // Get the updated ref of the working branch
-    const {
-      data: {object: workingRefObject}
-    } = await octokit.rest.git.getRef({
-      owner: github.context.repo.owner,
-      repo: github.context.repo.repo,
-      ref: 'heads/' + workingRef
-    })
-
-    // Replace the combined head only if it still points to the observed SHA.
-    const expectedHeadSha = existingHeadSha ?? baseBranchSHA
-    if (
-      !/^[0-9a-f]{40}$/i.test(expectedHeadSha ?? '') ||
-      !/^[0-9a-f]{40}$/i.test(workingRefObject.sha ?? '')
-    ) {
-      core.setFailed('Combined branch update has no valid head SHA')
-      return 'failure'
-    }
-    try {
-      const {data: repository} = await octokit.rest.repos.get({
-        owner: github.context.repo.owner,
-        repo: github.context.repo.repo
-      })
-      if (!repository?.node_id) {
-        core.setFailed('Combined branch repository has no node ID')
-        return 'failure'
-      }
-      const result = await octokit.graphql(
-        `mutation($input: UpdateRefsInput!) {
-          updateRefs(input: $input) { clientMutationId }
-        }`,
-        {
-          input: {
-            repositoryId: repository.node_id,
-            refUpdates: [
-              {
-                name: 'refs/heads/' + combineBranchName,
-                beforeOid: expectedHeadSha,
-                afterOid: workingRefObject.sha,
-                force: true
-              }
-            ]
+    // Merge all branches into the working ref.
+    for (const {branch, prString} of branchesAndPRStrings) {
+      try {
+        const mergeResult = await octokit.rest.repos.merge({
+          owner: github.context.repo.owner,
+          repo: github.context.repo.repo,
+          base: workingRef,
+          head: branch
+        })
+        if (existingCombinedPR && !createFromScratch) {
+          if (
+            mergeResult?.status === 201 &&
+            /^[0-9a-f]{40}$/i.test(mergeResult.data?.sha ?? '') &&
+            mergeResult.data?.parents?.[0]?.sha ===
+              expectedCombinedHeadAfterMerge
+          ) {
+            expectedCombinedHeadAfterMerge = mergeResult.data.sha
+          } else if (mergeResult?.status !== 204) {
+            core.setFailed(
+              'Combined branch merge returned no verifiable head SHA or parent'
+            )
+            return 'failure'
           }
         }
-      )
-      if (!result?.updateRefs) {
-        core.setFailed('Combined branch conditional update was not confirmed')
-        return 'failure'
+        core.info('Merged branch ' + branch)
+        combinedPRs.push(prString)
+      } catch (error) {
+        core.warning('Failed to merge branch ' + branch)
+        mergeFailedPRs.push(prString.replace('Closes ', ''))
       }
-      combinedHeadAfterScratch = workingRefObject.sha
-    } catch (error) {
-      core.error(error)
-      core.setFailed('Combined branch changed before conditional update')
-      return 'failure'
     }
 
-    // Delete the temp working branch
-    await octokit.rest.git.deleteRef({
-      owner: github.context.repo.owner,
-      repo: github.context.repo.repo,
-      ref: 'heads/' + workingRef
-    })
-  } else if (existingCombinedPR) {
-    const {data: combinedRef} = await octokit.rest.git.getRef({
-      owner: github.context.repo.owner,
-      repo: github.context.repo.repo,
-      ref: 'heads/' + combineBranchName
-    })
-    if (combinedRef?.object?.sha !== expectedCombinedHeadAfterMerge) {
-      core.setFailed('Combined branch changed after source merges')
-      return 'failure'
+    if (stagesCombinedHead) {
+      // Get the updated ref of the working branch
+      const {
+        data: {object: workingRefObject}
+      } = await octokit.rest.git.getRef({
+        owner: github.context.repo.owner,
+        repo: github.context.repo.repo,
+        ref: 'heads/' + workingRef
+      })
+
+      // Replace the combined head only if it still points to the observed SHA.
+      const expectedHeadSha = existingHeadSha ?? baseBranchSHA
+      if (
+        !/^[0-9a-f]{40}$/i.test(expectedHeadSha ?? '') ||
+        !/^[0-9a-f]{40}$/i.test(workingRefObject.sha ?? '')
+      ) {
+        core.setFailed('Combined branch update has no valid head SHA')
+        return 'failure'
+      }
+      if (
+        existingCombinedPR &&
+        !createFromScratch &&
+        workingRefObject.sha !== expectedCombinedHeadAfterMerge
+      ) {
+        core.setFailed('Staged combined branch changed after source merges')
+        return 'failure'
+      }
+      try {
+        const {data: repository} = await octokit.rest.repos.get({
+          owner: github.context.repo.owner,
+          repo: github.context.repo.repo
+        })
+        if (!repository?.node_id) {
+          core.setFailed('Combined branch repository has no node ID')
+          return 'failure'
+        }
+        // A ready or retargeted PR may retain the same head SHA. Check its
+        // state immediately before conditional publication.
+        if (
+          existingCombinedPR &&
+          !(await readCurrentCombinedPR(expectedHeadSha))
+        ) {
+          return 'failure'
+        }
+        const result = await octokit.graphql(
+          `mutation($input: UpdateRefsInput!) {
+          updateRefs(input: $input) { clientMutationId }
+        }`,
+          {
+            input: {
+              repositoryId: repository.node_id,
+              refUpdates: [
+                {
+                  name: 'refs/heads/' + combineBranchName,
+                  beforeOid: expectedHeadSha,
+                  afterOid: workingRefObject.sha,
+                  force: createFromScratch
+                }
+              ]
+            }
+          }
+        )
+        if (!result?.updateRefs) {
+          core.setFailed('Combined branch conditional update was not confirmed')
+          return 'failure'
+        }
+        combinedHeadAfterStaging = workingRefObject.sha
+      } catch (error) {
+        core.error(error)
+        core.setFailed('Combined branch changed before conditional update')
+        return 'failure'
+      }
+    }
+  } finally {
+    if (stagesCombinedHead) {
+      try {
+        await octokit.rest.git.deleteRef({
+          owner: github.context.repo.owner,
+          repo: github.context.repo.repo,
+          ref: 'heads/' + workingRef
+        })
+      } catch {
+        core.warning(`Failed to delete staging branch ${workingRef}`)
+      }
     }
   }
 
@@ -32328,7 +32334,7 @@ async function run() {
   let prOrigin
   if (existingCombinedPR) {
     const pr = await readCurrentCombinedPR(
-      combinedHeadAfterScratch ?? expectedCombinedHeadAfterMerge
+      combinedHeadAfterStaging ?? expectedCombinedHeadAfterMerge
     )
     if (!pr) return 'failure'
     await octokit.rest.pulls.update({
